@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Import as ImportIcon, Menu, RefreshCw, X } from 'lucide-react'
-import { AppHeader, getJson, postJson, ThemeToggle, uploadFile, usePolling } from '@dscpln/ui-kit'
+import { AppHeader, getBrand, getJson, postJson, ThemeToggle, uploadFile, usePolling } from '@dscpln/ui-kit'
 import { buildSenderPalette, dateLabel, relativeTime } from './lib/format.js'
 import Banner from './components/Banner.jsx'
 import ConversationView from './components/ConversationView.jsx'
@@ -645,7 +645,7 @@ export default function App() {
     <>
       <AppHeader
         className="topbar"
-        name="WhatsApp TXT"
+        brand={getBrand('watxt')}
         actions={(
           <>
             <button id="import" className="outline secondary icon-button" aria-label="Import chat exports" title="Import exports" onClick={openImport}>

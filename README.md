@@ -1,8 +1,8 @@
-# WhatsApp TXT
+# W@TXT
 
 **Browse, import and merge WhatsApp chat exports.**
 
-WhatsApp TXT turns exported `.txt` chats into searchable JSON conversations. It
+W@TXT turns exported `.txt` chats into searchable JSON conversations. It
 can merge exports of the same conversation from different backup folders,
 detect renamed contacts and groups, and serve the result in a web browser.
 
@@ -13,10 +13,11 @@ clean, searchable history without uploading the chats anywhere.
 
 | | |
 |---|---|
-| Runs at | `/watxt` (or port `8787` locally) |
+| Runs at | `https://watxt.<domain>/` (or port `8787` locally) |
 | Input | WhatsApp `.txt` exports or `.zip` archives |
 | Output | One `YYYYMMDD - <conversation>.json` file per conversation |
 | Data | The conversation directory, `/data` in the container |
+| Config | `WATXT_CONFIG`, default `./config/config.json` |
 | CLI | `WhatsAppTXT.mjs` for batch merges |
 
 ## Quick start
@@ -34,7 +35,10 @@ To browse the result in the web UI:
 
 ```sh
 npm install
-npm start -- --dir "/path/to/WhatsApp TXT"
+mkdir -p config
+cp config.example.json config/config.json
+# edit config/config.json so dataDir points at your conversation directory
+npm start
 ```
 
 Open <http://127.0.0.1:8787>. Browsing and search are read-only; the Import
@@ -263,12 +267,12 @@ The JSON API is `/api/state`, `/api/conversations`,
 ```sh
 docker run --rm -p 8787:8787 \
   -v "/path/to/WhatsApp TXT:/data" \
-  ghcr.io/imranr98/dscpln-watxt:latest
+  ghcr.io/imranr98/watxt:latest
 ```
 
-The container uses `/data` by default. Mount the conversation directory there;
-it can be read-only for browsing, but importing needs write access. `DATA_DIR`,
-`HOST` and `PORT` override the defaults. The image runs as uid 1000; if your
+The container config default is `/data`. Mount the conversation directory there;
+it can be read-only for browsing, but importing needs write access. `WATXT_CONFIG`
+points at the config file; `--dir`, `--host`, `--port` and `--no-watch` override it. The image runs as uid 1000; if your
 files use another owner, add `--user "$(id -u):$(id -g)"`. `python3` and
 `unzip` are bundled: Python's `zipfile` extracts archives (including WhatsApp's
 FAT-origin unicode names) and `unzip` validates them first.

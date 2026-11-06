@@ -302,7 +302,7 @@ export const createApp = (state, options = {}) => {
     // HTML injection, CSRF origin check, /ui kit assets and /api/health.
     const basePath = options.basePath ?? process.env.BASE_PATH ?? ''
     const app = createKitApp({
-        title: 'WhatsApp TXT',
+        title: 'W@TXT',
         pageTitle: null,
         basePath,
         staticDir: STATIC_DIR,
@@ -522,16 +522,29 @@ export const createState = (dataDir, { watch = true } = {}) => {
     return state
 }
 
-const USAGE = `Usage: node server.mjs --dir <json-directory> [options]
+const USAGE = `Usage: node server.mjs [--dir <json-directory>] [options]
 
 Serves a local web UI for browsing and searching WhatsApp TXT JSON conversations.
+Reads WATXT_CONFIG (default ./config/config.json) when present; flags override it.
 
 Options:
-  --dir <path>     Directory of conversation .json files (required)
-  --port <number>  Port to listen on (default 8787)
-  --host <name>    Host to bind (default 127.0.0.1)
+  --dir <path>     Directory of conversation .json files
+  --port <number>  Port to listen on
+  --host <name>    Host to bind
   --no-watch       Do not watch the directory for changes
   --help           Show this help`
+
+const readFileConfig = () => {
+    const file = path.resolve(process.env.WATXT_CONFIG ?? './config/config.json')
+    if (!fs.existsSync(file)) return {}
+    try {
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+    } catch (err) {
+        console.error(`error: could not read config ${file}: ${err.message}`)
+        process.exit(2)
+    }
+}
 
 const main = async () => {
     let values
@@ -540,9 +553,9 @@ const main = async () => {
             allowNegative: true,
             options: {
                 dir: { type: 'string' },
-                port: { type: 'string', default: '8787' },
-                host: { type: 'string', default: '127.0.0.1' },
-                watch: { type: 'boolean', default: true },
+                port: { type: 'string' },
+                host: { type: 'string' },
+                watch: { type: 'boolean' },
                 help: { type: 'boolean', default: false }
             }
         }).values
@@ -555,22 +568,20 @@ const main = async () => {
         console.log(USAGE)
         process.exit(0)
     }
-    if (!values.dir) {
-        console.error('error: --dir is required')
-        console.error(USAGE)
-        process.exit(2)
-    }
-    const dataDir = path.resolve(values.dir)
+    const config = readFileConfig()
+    const dataDir = path.resolve(values.dir ?? config.dataDir ?? './data')
     if (!fs.existsSync(dataDir) || !fs.statSync(dataDir).isDirectory()) {
         console.error(`error: not a directory: ${dataDir}`)
         process.exit(2)
     }
-    const state = createState(dataDir, { watch: values.watch })
+    const watch = values.watch ?? config.watch ?? true
+    const state = createState(dataDir, { watch })
     const app = createApp(state)
-    const port = Number(values.port)
-    const server = app.listen(port, values.host, () => {
+    const port = Number(values.port ?? config.port ?? 8787)
+    const host = values.host ?? config.host ?? '127.0.0.1'
+    const server = app.listen(port, host, () => {
         const { conversations, totalMessages, skipped } = state.index
-        console.log(`whatsapptxt browser: http://${values.host}:${port}`)
+        console.log(`W@TXT browser: http://${host}:${port}`)
         console.log(`indexed ${conversations.length} conversations, ${totalMessages.toLocaleString()} messages${skipped.length ? ` (${skipped.length} file(s) skipped)` : ''}`)
     })
     const shutdown = () => {
