@@ -455,3 +455,99 @@ test('api: import refuses archives containing symlinks', { skip: !haveZip }, asy
         assert.match((await merged.json()).error, /symlink/)
     })
 })
+
+test('buildIndex: rejects invalid senders/types and sorts unsorted JSON', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whatsapptxt-sort-'))
+    const unsorted = [
+        { date: new Date(2024, 0, 3, 10, 0).toISOString(), sender: 'Bob', type: 'text', body: 'third' },
+        { date: new Date(2024, 0, 1, 10, 0).toISOString(), sender: 'Alice', type: 'text', body: 'first' },
+        { date: new Date(2024, 0, 2, 10, 0).toISOString(), sender: null, type: 'system', body: 'second' },
+    ]
+    fs.writeFileSync(path.join(dir, 'Unsorted.json'), JSON.stringify(unsorted))
+    fs.writeFileSync(path.join(dir, 'BadSender.json'), JSON.stringify([{ date: new Date().toISOString(), sender: {}, type: 'text', body: 'x' }]))
+    fs.writeFileSync(path.join(dir, 'BadType.json'), JSON.stringify([{ date: new Date().toISOString(), sender: 'A', type: 'nope', body: 'x' }]))
+    const index = buildIndex(dir)
+    assert.equal(index.conversations.length, 1)
+    const messages = index.conversations[0].messages
+    assert.deepEqual(messages.map(message => message.body), ['first', 'second', 'third'])
+    assert.deepEqual(messages.map(message => message.index), [0, 1, 2])
+    assert.equal(messages[0].date < messages[1].date, true)
+    assert.deepEqual(index.skipped.map(item => item.file).sort(), ['BadSender.json', 'BadType.json'])
+})
+
+test('api: import JSON control routes do not consume raw uploads', async () => {
+    const { state } = makeImportState()
+    await withServer(state, async base => {
+        const uploaded = await fetch(`${base}/api/import/upload?batch=json-type&name=WhatsApp%20Chat%20with%20Phone.txt`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: TXT_EXPORT
+        })
+        assert.equal(uploaded.status, 200)
+        const merged = await merge(base, { batch: 'json-type' })
+        assert.equal(merged.status, 200)
+        assert.equal((await merged.json()).names.includes('20240115 - Phone.json'), true)
+    })
+})
+
+test('api: merge/upload/cancel are refused while a merge is active', async () => {
+    const { dir, state } = makeImportState()
+    await withServer(state, async base => {
+        await upload(base, 'locked', 'WhatsApp Chat with Phone.txt', TXT_EXPORT)
+        state.mergeInFlight = true
+        try {
+            assert.equal((await merge(base, { batch: 'locked' })).status, 409)
+            assert.equal((await upload(base, 'locked', 'other.txt', TXT_EXPORT)).status, 409)
+            const cancelled = await fetch(base + '/api/import/cancel', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ batch: 'locked' })
+            })
+            assert.equal(cancelled.status, 409)
+            assert.equal(fs.existsSync(path.join(dir, '.watxt-incoming', 'locked')), true)
+        } finally {
+            state.mergeInFlight = false
+        }
+        // A failed merge still releases the lock.
+        assert.equal((await merge(base, { batch: 'missing' })).status, 404)
+        assert.equal(state.mergeInFlight, false)
+    })
+})
+
+test('state.reload recovers after a transient build failure', async () => {
+    const dir = makeDataDir()
+    const state = createState(dir, { watch: false })
+    const first = state.index.conversations.length
+    fs.renameSync(dir, `${dir}-moved`)
+    await assert.rejects(state.reload())
+    fs.renameSync(`${dir}-moved`, dir)
+    await state.reload()
+    assert.equal(state.index.conversations.length, first)
+})
+
+test('api: import refuses an archive with an oversized declared payload', { skip: !havePython }, async () => {
+    const { state } = makeImportState()
+    await withServer(state, async base => {
+        const work = fs.mkdtempSync(path.join(os.tmpdir(), 'whatsapptxt-bomb-'))
+        const zipFile = path.join(work, 'bomb.zip')
+        execFileSync('python3', ['-c', `
+import struct, sys, zipfile
+path = sys.argv[1]
+with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr('WhatsApp Chat with Bomb.txt', b'hello')
+data = bytearray(open(path, 'rb').read())
+central = data.find(b'PK\\x01\\x02')
+local = data.find(b'PK\\x03\\x04')
+huge = 2 * 1024 * 1024 * 1024
+struct.pack_into('<I', data, central + 24, huge)
+struct.pack_into('<I', data, local + 22, huge)
+open(path, 'wb').write(data)
+`, zipFile])
+        const uploaded = await upload(base, 'bomb', 'bomb.zip', fs.readFileSync(zipFile))
+        assert.equal(uploaded.status, 200)
+        const merged = await merge(base, { batch: 'bomb' })
+        assert.equal(merged.status, 400)
+        assert.match((await merged.json()).error, /1 GB|256 MB/)
+        assert.equal(state.mergeInFlight, false)
+    })
+})

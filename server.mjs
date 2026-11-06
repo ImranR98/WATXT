@@ -26,6 +26,14 @@ import { main as mergeExports } from './src/index.mjs'
 const IMPORT_DIR = '.watxt-incoming'
 const IMPORT_EXTENSIONS = new Set(['.zip', '.txt'])
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+const MAX_BATCH_FILES = 400
+const MAX_BATCH_BYTES = 400 * 1024 * 1024
+const MAX_ZIP_ENTRIES = 20_000
+const MAX_ZIP_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
+const MAX_ZIP_ENTRY_BYTES = 256 * 1024 * 1024
+const MAX_STAGING_BYTES = 1024 * 1024 * 1024
+const MAX_STAGING_FILES = 20_000
+const MAX_NESTED_ZIP_DEPTH = 3
 const DATE_ORDERS = ['auto', 'dmy', 'mdy', 'ymd']
 
 const displayName = (filename) => filename.replace(/\.json$/i, '').replace(/^\d{8} - /, '')
@@ -67,18 +75,27 @@ export const buildIndex = (dataDir) => {
             if (!stat.isFile()) continue
             const raw = JSON.parse(fs.readFileSync(full, 'utf8'))
             if (!Array.isArray(raw)) throw new Error('not an array of messages')
-            messages = raw.map((message, index) => {
+            const parsed = raw.map((message, index) => {
                 if (!message || typeof message.body !== 'string') throw new Error(`message ${index} has no body`)
                 const date = new Date(message.date).valueOf()
                 if (Number.isNaN(date)) throw new Error(`message ${index} has an invalid date`)
+                if (message.sender != null && typeof message.sender !== 'string') {
+                    throw new Error(`message ${index} has an invalid sender`)
+                }
+                if (message.type != null && !MESSAGE_TYPES.has(message.type)) {
+                    throw new Error(`message ${index} has an invalid type`)
+                }
                 return {
-                    index,
                     date,
                     sender: message.sender ?? null,
                     type: MESSAGE_TYPES.has(message.type) ? message.type : 'text',
                     body: message.body
                 }
             })
+            // Imported JSON is not guaranteed to be date-ordered; first/last
+            // and scoped search depend on it, so normalize once here.
+            parsed.sort((a, b) => a.date - b.date)
+            messages = parsed.map((message, index) => ({ ...message, index }))
         } catch (e) {
             skipped.push({ file, reason: e.message })
             continue
@@ -238,7 +255,26 @@ const uploadFileName = (value) => {
 // Reject archives that could escape extraction: absolute or `..` member
 // names, or any symlink entry (a later member written through it could land
 // outside the staging dir — sanitizeStaging runs too late).
+const zipSummary = async (file) => {
+    const script = `import json, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    infos = archive.infolist()
+    print(json.dumps({
+        "entries": len(infos),
+        "bytes": sum(info.file_size for info in infos),
+        "largest": max((info.file_size for info in infos), default=0),
+    }))
+`
+    const { stdout } = await execFile('python3', ['-c', script, file], { maxBuffer: 1024 * 1024 })
+    return JSON.parse(stdout)
+}
+
 const assertSafeZip = async (file) => {
+    const summary = await zipSummary(file)
+    if (summary.entries > MAX_ZIP_ENTRIES) throw new Error(`the archive contains too many entries (${summary.entries})`)
+    if (summary.bytes > MAX_ZIP_UNCOMPRESSED_BYTES) throw new Error('the archive expands to more than 1 GB')
+    if (summary.largest > MAX_ZIP_ENTRY_BYTES) throw new Error('the archive contains an entry larger than 256 MB')
+
     const names = await execFile('unzip', ['-Z1', file])
     for (const name of names.stdout.split('\n')) {
         if (!name) continue
@@ -257,6 +293,29 @@ const assertSafeZip = async (file) => {
 // stay readable by Node and the merge can open them.
 const extractZip = async (file, staging) => {
     await execFile('python3', ['-m', 'zipfile', '-e', file, staging])
+}
+
+// Extracted plus nested archives must still fit the staging budget. Checked
+// after every extraction pass so a many-nested-zip archive cannot fill the
+// data volume before the merge starts.
+const assertStagingLimits = async (staging) => {
+    let files = 0
+    let bytes = 0
+    const walk = async (dir) => {
+        for (const entry of await fsp.readdir(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name)
+            if (entry.isDirectory()) {
+                await walk(full)
+                continue
+            }
+            if (!entry.isFile()) continue
+            files += 1
+            bytes += (await fsp.stat(full)).size
+            if (files > MAX_STAGING_FILES) throw new Error(`the archive expands to more than ${MAX_STAGING_FILES} files`)
+            if (bytes > MAX_STAGING_BYTES) throw new Error('the archive expands to more than 1 GB')
+        }
+    }
+    await walk(staging)
 }
 
 // Extracted archives must stay inside the staging dir: symlinks are removed
@@ -309,7 +368,9 @@ export const createApp = (state, options = {}) => {
         jsonBody: false, // /api/import/upload streams raw bytes
         healthExtra: () => ({ conversations: state.index.conversations.length }),
         routes: (router) => {
-            router.use('/api/import', express.json({ limit: '1mb' }))
+            // Only the small JSON control requests are parsed. The upload route
+            // streams raw bytes; a global parser would consume that stream.
+            const importJson = express.json({ limit: '1mb' })
 
             router.get('/api/state', (req, res) => {
         res.json(stateSummary(state.index, state.watching))
@@ -363,13 +424,24 @@ export const createApp = (state, options = {}) => {
         const name = uploadFileName(req.query.name)
         if (!safeBatchName(batch)) return res.status(400).json({ error: 'batch must match [A-Za-z0-9_-]{1,64}' })
         if (!name) return res.status(400).json({ error: 'name must be a .zip or .txt file name without a path' })
+        if (state.mergeInFlight) return res.status(409).json({ error: 'a merge is already running' })
         const batchDir = path.join(state.incomingRoot, batch)
         await fsp.mkdir(batchDir, { recursive: true })
+        const existing = await fsp.readdir(batchDir).catch(() => [])
+        if (existing.length >= MAX_BATCH_FILES) {
+            return res.status(413).json({ error: `a batch may contain at most ${MAX_BATCH_FILES} files` })
+        }
+        const existingBytes = await Promise.all(existing.map(async (entry) => {
+            const stat = await fsp.stat(path.join(batchDir, entry)).catch(() => null)
+            return stat?.isFile() ? stat.size : 0
+        }))
+        const usedBytes = existingBytes.reduce((total, size) => total + size, 0)
+
         const target = path.join(batchDir, name)
-        const part = `${target}.part`
+        const part = `${target}.part-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`
         let size = 0
         let tooLarge = false
-        const stream = fs.createWriteStream(part)
+        const stream = fs.createWriteStream(part, { flags: 'wx' })
         req.on('data', (chunk) => {
             size += chunk.length
             if (size > MAX_UPLOAD_BYTES && !tooLarge) {
@@ -379,43 +451,49 @@ export const createApp = (state, options = {}) => {
                 req.resume()
             }
         })
-        await new Promise((resolve, reject) => {
-            stream.on('finish', resolve)
-            stream.on('close', resolve)
-            stream.on('error', reject)
-            req.on('error', reject)
-            req.pipe(stream)
-        })
-        if (tooLarge) {
-            await fsp.rm(part, { force: true })
-            return res.status(413).json({ error: `upload exceeds the ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB limit` })
+        try {
+            await new Promise((resolve, reject) => {
+                stream.on('finish', resolve)
+                stream.on('close', resolve)
+                stream.on('error', reject)
+                req.on('error', reject)
+                req.pipe(stream)
+            })
+            if (tooLarge) {
+                return res.status(413).json({ error: `upload exceeds the ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB limit` })
+            }
+            if (size === 0) {
+                return res.status(400).json({ error: 'upload is empty' })
+            }
+            if (usedBytes + size > MAX_BATCH_BYTES) {
+                return res.status(413).json({ error: `a batch may contain at most ${Math.round(MAX_BATCH_BYTES / 1024 / 1024)} MB` })
+            }
+            await fsp.rename(part, target)
+            res.json({ ok: true, batch, name, size })
+        } finally {
+            await fsp.rm(part, { force: true }).catch(() => {})
         }
-        if (size === 0) {
-            await fsp.rm(part, { force: true })
-            return res.status(400).json({ error: 'upload is empty' })
-        }
-        await fsp.rename(part, target)
-        res.json({ ok: true, batch, name, size })
     }))
 
     // Merges a batch's uploads into the data directory. `dryRun` previews
     // without touching anything (and keeps the batch for a real merge).
-            router.post('/api/import/merge', checkSameOrigin, asyncRoute(async (req, res) => {
+            router.post('/api/import/merge', importJson, checkSameOrigin, asyncRoute(async (req, res) => {
         const { batch } = req.body ?? {}
         const dryRun = req.body?.dryRun === true
         const dateOrder = req.body?.dateOrder ?? 'auto'
         if (!safeBatchName(batch)) return res.status(400).json({ error: 'batch must match [A-Za-z0-9_-]{1,64}' })
         if (!DATE_ORDERS.includes(dateOrder)) return res.status(400).json({ error: `dateOrder must be one of ${DATE_ORDERS.join(', ')}` })
+        // Claim the lock before the first await; the readdir/stat checks below
+        // otherwise let two requests both pass the check.
         if (state.mergeInFlight) return res.status(409).json({ error: 'a merge is already running' })
-        const batchDir = path.join(state.incomingRoot, batch)
-        const incoming = await fsp.readdir(batchDir).catch(() => null)
-        if (!incoming) return res.status(404).json({ error: 'no uploads for this batch' })
-        const inputs = incoming.filter((name) => name !== 'staging' && !name.startsWith('.'))
-        if (inputs.length === 0) return res.status(400).json({ error: 'no uploads for this batch' })
-
         state.mergeInFlight = true
+        const batchDir = path.join(state.incomingRoot, batch)
         const staging = path.join(batchDir, 'staging')
         try {
+            const incoming = await fsp.readdir(batchDir).catch(() => null)
+            if (!incoming) return res.status(404).json({ error: 'no uploads for this batch' })
+            const inputs = incoming.filter((name) => name !== 'staging' && !name.startsWith('.'))
+            if (inputs.length === 0) return res.status(400).json({ error: 'no uploads for this batch' })
             await fsp.rm(staging, { recursive: true, force: true })
             await fsp.mkdir(staging, { recursive: true })
             for (const name of inputs) {
@@ -429,14 +507,20 @@ export const createApp = (state, options = {}) => {
                     await fsp.copyFile(full, path.join(staging, name))
                 }
             }
-            // Archives can contain another zip level.
-            for (const name of await fsp.readdir(staging)) {
-                if (!name.toLowerCase().endsWith('.zip')) continue
-                const nested = path.join(staging, name)
-                await assertSafeZip(nested)
-                await extractZip(nested, staging)
-                await fsp.rm(nested, { force: true })
+            // Archives can contain further zip levels. Expand a few rounds and
+            // enforce the staging budget after each round.
+            for (let depth = 0; depth < MAX_NESTED_ZIP_DEPTH; depth += 1) {
+                const nestedZips = (await fsp.readdir(staging)).filter((name) => name.toLowerCase().endsWith('.zip'))
+                if (nestedZips.length === 0) break
+                for (const name of nestedZips) {
+                    const nested = path.join(staging, name)
+                    await assertSafeZip(nested)
+                    await extractZip(nested, staging)
+                    await fsp.rm(nested, { force: true })
+                }
+                await assertStagingLimits(staging)
             }
+            await assertStagingLimits(staging)
             await sanitizeStaging(staging)
             for (const name of await fsp.readdir(staging)) {
                 if (name.toLowerCase().endsWith('.vcf')) await fsp.rm(path.join(staging, name), { force: true })
@@ -468,15 +552,18 @@ export const createApp = (state, options = {}) => {
             res.json(topLevel)
         } catch (e) {
             await fsp.rm(staging, { recursive: true, force: true }).catch(() => {})
-            res.status(400).json({ error: String(e?.message ?? e) })
+            const status = typeof e?.code === 'string' && e.code.startsWith('E') ? 500 : 400
+            if (status === 500) console.error(`import merge failed: ${e.stack ?? e}`)
+            res.status(status).json({ error: String(e?.message ?? e) })
         } finally {
             state.mergeInFlight = false
         }
     }))
 
-            router.post('/api/import/cancel', checkSameOrigin, asyncRoute(async (req, res) => {
+            router.post('/api/import/cancel', importJson, checkSameOrigin, asyncRoute(async (req, res) => {
         const { batch } = req.body ?? {}
         if (!safeBatchName(batch)) return res.status(400).json({ error: 'batch must match [A-Za-z0-9_-]{1,64}' })
+        if (state.mergeInFlight) return res.status(409).json({ error: 'a merge is already running' })
         await fsp.rm(path.join(state.incomingRoot, batch), { recursive: true, force: true })
         res.json({ ok: true })
     }))
@@ -496,7 +583,26 @@ export const createWatcher = (dataDir, rebuild, { debounceMs = 500 } = {}) => {
         clearTimeout(timer)
         timer = setTimeout(() => rebuild(), debounceMs)
     })
+    watcher.on('error', (error) => {
+        console.error(`watch failed for ${dataDir}: ${error.message}`)
+    })
     return { close: () => { clearTimeout(timer); watcher.close() } }
+}
+
+const INCOMING_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+// Abandoned upload batches otherwise stay in the data volume forever.
+const sweepIncoming = async (root) => {
+    const entries = await fsp.readdir(root, { withFileTypes: true }).catch(() => [])
+    const cutoff = Date.now() - INCOMING_TTL_MS
+    for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const full = path.join(root, entry.name)
+        const stat = await fsp.stat(full).catch(() => null)
+        if (stat && stat.mtimeMs < cutoff) {
+            await fsp.rm(full, { recursive: true, force: true }).catch(() => {})
+        }
+    }
 }
 
 export const createState = (dataDir, { watch = true } = {}) => {
@@ -512,9 +618,12 @@ export const createState = (dataDir, { watch = true } = {}) => {
     }
     let pending = Promise.resolve()
     state.reload = () => {
-        pending = pending.then(() => { state.index = buildIndex(dataDir) })
+        pending = pending.catch(() => {}).then(() => { state.index = buildIndex(dataDir) })
         return pending
     }
+    sweepIncoming(state.incomingRoot).catch((error) => {
+        console.error(`could not sweep old import batches: ${error.message}`)
+    })
     if (watch) {
         state.close = createWatcher(dataDir, () => { state.reload().catch(() => {}) }).close
         state.watching = true
