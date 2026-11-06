@@ -275,13 +275,13 @@ const assertSafeZip = async (file) => {
     if (summary.bytes > MAX_ZIP_UNCOMPRESSED_BYTES) throw new Error('the archive expands to more than 1 GB')
     if (summary.largest > MAX_ZIP_ENTRY_BYTES) throw new Error('the archive contains an entry larger than 256 MB')
 
-    const names = await execFile('unzip', ['-Z1', file])
+    const names = await execFile('unzip', ['-Z1', file], { maxBuffer: 8 * 1024 * 1024 })
     for (const name of names.stdout.split('\n')) {
         if (!name) continue
         if (name.startsWith('/') || /^[A-Za-z]:[\\/]/.test(name)) throw new Error('the archive contains an absolute path')
         if (name.split(/[\\/]/).includes('..')) throw new Error('the archive contains a parent path')
     }
-    const listing = await execFile('unzip', ['-Z', file])
+    const listing = await execFile('unzip', ['-Z', file], { maxBuffer: 8 * 1024 * 1024 })
     for (const line of listing.stdout.split('\n')) {
         if (line.startsWith('l')) throw new Error('the archive contains a symlink')
     }
